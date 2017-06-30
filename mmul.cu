@@ -12,7 +12,7 @@ N*N行列の行列積。共有メモリを用いない簡単な方法。
 #define Block 8192
 #define Thread 1024
 
-__global__ void mmul(int *a, int *b, int *c){
+__global__ void mmul(float *a, float *b, float *c){
   long tid = blockIdx.x * Thread + threadIdx.x;
   int row = tid / N;
   int col = tid % N;
@@ -24,7 +24,7 @@ __global__ void mmul(int *a, int *b, int *c){
   }
 }
 
-void mmulcpu(int *a, int *b, int *c){
+void mmulcpu(float *a, float *b, float *c){
   for(int i = 0; i < N; i++){
     for(int j = 0; j < N; j++){
       for(int k = 0; k < N; k++){
@@ -34,17 +34,26 @@ void mmulcpu(int *a, int *b, int *c){
   }
 }
 
+void printm(float *a, int n, int m){
+  for(int i = 0; i < n; i++){
+    for(int j = 0; j < m; j++){
+      printf("%f ", a[i*N+j]);
+    }
+    printf("\n");
+  }
+}
+
 int main(void){
-  int *a, *b, *c;
-  int *dev_a, *dev_b, *dev_c;
+  float *a, *b, *c;
+  float *dev_a, *dev_b, *dev_c;
 
-  a = (int *)malloc(N*N*sizeof(int));
-  b = (int *)malloc(N*N*sizeof(int));
-  c = (int *)malloc(N*N*sizeof(int));
+  a = (float *)malloc(N*N*sizeof(float));
+  b = (float *)malloc(N*N*sizeof(float));
+  c = (float *)malloc(N*N*sizeof(float));
 
-  HANDLE_ERROR(cudaMalloc((void**)&dev_a, N*N*sizeof(int)));
-  HANDLE_ERROR(cudaMalloc((void**)&dev_b, N*N*sizeof(int)));
-  HANDLE_ERROR(cudaMalloc((void**)&dev_c, N*N*sizeof(int)));
+  HANDLE_ERROR(cudaMalloc((void**)&dev_a, N*N*sizeof(float)));
+  HANDLE_ERROR(cudaMalloc((void**)&dev_b, N*N*sizeof(float)));
+  HANDLE_ERROR(cudaMalloc((void**)&dev_c, N*N*sizeof(float)));
 
   for(int i = 0; i < N; i++){
     for(int j = 0; j < N; j++){
@@ -54,19 +63,20 @@ int main(void){
     }
   }
 
-  HANDLE_ERROR(cudaMemcpy(dev_a, a, N*N*sizeof(int), cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(dev_b, b, N*N*sizeof(int), cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(dev_c, c, N*N*sizeof(int), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(dev_a, a, N*N*sizeof(float), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(dev_b, b, N*N*sizeof(float), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(dev_c, c, N*N*sizeof(float), cudaMemcpyHostToDevice));
 
-  mmul<<<Block, Thread>>>(dev_a, dev_b, dev_c);
+  dim3 grid(Block, Block);
+  mmul<<<grid, Thread>>>(dev_a, dev_b, dev_c);
 
-  HANDLE_ERROR(cudaMemcpy(c, dev_c, N*N*sizeof(int), cudaMemcpyDeviceToHost));
+  HANDLE_ERROR(cudaMemcpy(c, dev_c, N*N*sizeof(float), cudaMemcpyDeviceToHost));
 
   /*
-  int  *a2, *b2, *c2;
-  a2 = (int *)malloc(N*N*sizeof(int));
-  b2 = (int *)malloc(N*N*sizeof(int));
-  c2 = (int *)malloc(N*N*sizeof(int));
+  float  *a2, *b2, *c2;
+  a2 = (float *)malloc(N*N*sizeof(float));
+  b2 = (float *)malloc(N*N*sizeof(float));
+  c2 = (float *)malloc(N*N*sizeof(float));
   for(int i = 0; i < N; i++){
     for(int j = 0; j < N; j++){
       a2[i*N+j] = i - j;
