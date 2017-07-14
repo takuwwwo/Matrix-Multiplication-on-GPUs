@@ -10,9 +10,10 @@ N*N行列の行列積。共有メモリを用いる一般的な方法。
 #include <curand.h>
 #include <sys/time.h>
 
-#define N 8192
+#define N 1024
 #define Block 8192
 #define Thread 1024
+#define BLOCK_SIZE 32
 
 void GPU_fill_rand(float *a, int row, int col){
   curandGenerator_t prng;
@@ -21,79 +22,6 @@ void GPU_fill_rand(float *a, int row, int col){
   curandSetPseudoRandomGeneratorSeed(prng, (unsigned long long) clock());
 
   curandGenerateUniform(prng, a, row*col);
-}
-
-void GPU_blas_mmul(const float *a, const float *b, float *c, const int m, const int k, const int n){
-  float *dev_a, *dev_b, *dev_c;
-  float alf = 1.0;
-  float bet = 0.0;
-  float *alpha = &alf;
-  float *beta = &bet;
-  HANDLE_ERROR(cudaMalloc((void**)&dev_a, N*N*sizeof(float)));
-  HANDLE_ERROR(cudaMalloc((void**)&dev_b, N*N*sizeof(float)));
-  HANDLE_ERROR(cudaMalloc((void**)&dev_c, N*N*sizeof(float)));
-  HANDLE_ERROR(cudaMemcpy(dev_a, a, N*N*sizeof(float), cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(dev_b, b, N*N*sizeof(float), cudaMemcpyHostToDevice));
-
-  cublasHandle_t handle;
-  cublasCreate(&handle);
-  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, alpha, dev_a, N, dev_b, N, beta, dev_c, N);
-  HANDLE_ERROR(cudaMemcpy(c, dev_c, N*N*sizeof(float), cudaMemcpyDeviceToHost));
-
-  cublasDestroy(handle);
-
-  HANDLE_ERROR(cudaFree(dev_a));
-  HANDLE_ERROR(cudaFree(dev_b));
-  HANDLE_ERROR(cudaFree(dev_c));
-}
-
-__global__ void mmul(float *a, float *b, float *c){
-  long tid = blockIdx.x * Thread + threadIdx.x;
-  while(tid < N * N){
-    int row = tid / N;
-    int col = tid % N;
-    c[tid] = 0;
-    for(int i = 0; i < N; i++){
-      c[row*N+col] += a[row*N+i] * b[i*N+col];
-    }
-    tid += Thread * Block;
-  }
-}
-
-__global__ void mmul2(float *a, float *b, float *c){
-  int acol = 0;
-  int arow = threadIdx.x;
-  int bcol = blockIdx.x;
-  int brow = arow;
-  __shared__ float cache[Thread];
-  for(int i = 0; i <= N/Block; i++){
-    for(int j = 0; j <= N/Thread; j++){        //各列の演算でのループ
-      int bcolN = (bcol < N);
-      if(brow < N && bcolN){
-        cache[brow - Thread*j] = b[brow*N + bcol];  //共有メモリに行列Bの(row, col)をコピー
-      }
-      __syncthreads();  //同期
-      if(bcolN){
-        for(int k = 0; k <= N/Thread; k++){
-          int arow2N = (arow + k*Thread)*N;
-          if(arow2N < N*N){
-            float sum = (j == 0) ? 0.0 : c[arow2N+bcol];
-            int fl = (acol+Thread < N) ? acol+Thread : N;
-            for(int l = acol; l < fl; l++){
-              sum += a[arow2N+l]*cache[l-acol];
-            }
-            c[arow2N+bcol] = sum;
-          }
-        }
-      }
-      acol += Thread;
-      brow += Thread;
-      __syncthreads();
-    }
-    brow = threadIdx.x;
-    bcol += Block;
-    acol = 0;
-  }
 }
 
 __global__ void transpose(float *a){                            //OK
@@ -110,15 +38,100 @@ __global__ void transpose(float *a){                            //OK
   }
 }
 
-void mmulcpu(float *a, float *b, float *c){
-  for(int i = 0; i < N; i++){
-    for(int j = 0; j < N; j++){
-      c[i*N+j] = 0.0;
-      for(int k = 0; k < N; k++){
-        c[i*N+j] += a[i*N+k]*b[k*N+j];
-      }
+__global__ void mmul3(float *a, float *b, float *c){
+  int row = threadIdx.y, col = threadIdx.x;
+  int arow = blockIdx.y*BLOCK_SIZE + row;
+  int bcol = blockIdx.x*BLOCK_SIZE + col;
+
+  __shared__ float cachea[BLOCK_SIZE][BLOCK_SIZE*2];
+  __shared__ float cacheb[BLOCK_SIZE*2][BLOCK_SIZE];
+  float sum = 0.0;
+
+  int ax = arow*N+col;
+  int bx = row*N+bcol;
+  for(int i = 0; i < N; ){
+    cachea[row][col] = a[ax+i];
+    cacheb[row][col] = b[bx+i*N];
+    i += BLOCK_SIZE;
+    cachea[row][col+BLOCK_SIZE] = a[ax+i];
+    cacheb[row+BLOCK_SIZE][col] = b[bx+i*N];
+    i += BLOCK_SIZE;
+    __syncthreads();
+
+    #pragma unroll
+    for(int j = 0; j < 64; j++){
+      sum += cachea[row][j]*cacheb[j][col];
     }
+    __syncthreads();
   }
+  c[arow*N+bcol] = sum;
+}
+
+__device__ void update2(float *a, float b, float *c){
+  for(int i = 0; i < 16; i++) c[i] += a[i*4] * b;
+}
+
+__global__ void gpu8(float *a, float *b, float *c, int n){
+  __shared__ float as[16*65];
+
+  float cr[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  int nDiv64 = n/64;
+  int srow = threadIdx.y;
+  int srow4 = srow*4;
+  int scol = threadIdx.x;
+  int tid = srow*16+scol;
+  int aNext = (16*blockIdx.y+srow)*n+scol*4;
+  int bNext = 128*blockIdx.x + tid;
+  int cNext = 16*blockIdx.y*n + 128*blockIdx.x + tid;
+  int nTimes2 = 2*n;
+  int nTimes3 = 3*n;
+  int nTimes4 = 4*n;
+
+  a += aNext;
+  b += bNext;
+  c += cNext;
+
+  for(int i = 0; i < nDiv64; i++){
+    #pragma unroll
+    for(int j = 0; j < 4; j++){
+      as[scol][srow4+j] = a[j];
+    }
+    #pragma unroll
+    for(int j = 0; j < 4; j++){
+      as[scol][srow4+32+j] = a[nTimes2*4+j];
+    }
+    __syncthreads();
+
+
+    float br0 = b[0];
+    float br1 = b[n];
+    float br2 = b[nTimes2];
+    float br3 = b[nTimes3];
+
+    b += nTimes4;
+
+    #pragma unroll
+    for(int k = 0; k < 15; k++){
+      update2(&as[k][0], br0, cr); br0 = b[0];
+      update2(&as[k][1], br1, cr); br1 = b[n];
+      update2(&as[k][2], br2, cr); br2 = b[nTimes2];
+      update2(&as[k][3], br3, cr); br3 = b[nTimes3];
+
+      b += nTimes4;
+    }
+    update2(&as[15][0], br0, cr);
+    update2(&as[15][1], br1, cr);
+    update2(&as[15][2], br2, cr);
+    update2(&as[15][3], br3, cr);
+
+    a += 64;
+    __syncthreads();
+  }
+  for(int j = 0; j < 16; j++){
+    c[0] = cr[j];
+    c += n;
+  }
+
 }
 
 void printm(float *a, int n, int m){
@@ -160,14 +173,25 @@ int main(void){
   //mmulcpu(a, b, c4);
 
   gettimeofday(&t0, NULL);
-  mmul<<<Block, Thread>>>(dev_a, dev_b, dev_c);
+  //mmul<<<Block, Thread>>>(dev_a, dev_b, dev_c);
   cudaThreadSynchronize();
   gettimeofday(&t1, NULL);
   printf("Elapsed time(mmul)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
   HANDLE_ERROR(cudaMemcpy(c1, dev_c, N*N*sizeof(float), cudaMemcpyDeviceToHost));
 
   gettimeofday(&t0, NULL);
-  mmul2<<<Block, Thread>>>(dev_a, dev_b, dev_c2);
+  dim3 block2(16, 16);
+  dim3 grid2(N/128, N/16);
+  gpu8<<<grid2, block2>>>(dev_a, dev_b, dev_c, N);
+  cudaThreadSynchronize();
+  gettimeofday(&t1, NULL);
+  printf("Elapsed time(gpu8)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
+  HANDLE_ERROR(cudaMemcpy(c1, dev_c, N*N*sizeof(float), cudaMemcpyDeviceToHost));
+
+  gettimeofday(&t0, NULL);
+  dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 grid(N/BLOCK_SIZE, N/BLOCK_SIZE);
+  mmul3<<<grid, block>>>(dev_a, dev_b, dev_c2);
   cudaThreadSynchronize();
   gettimeofday(&t1, NULL);
   printf("Elapsed time(mmul2)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
@@ -176,16 +200,15 @@ int main(void){
   cublasHandle_t handle;
   cublasCreate(&handle);
   float alpha = 1.0, beta = 0.0;
-  transpose<<<Block, Thread>>>(dev_a);
-  transpose<<<Block, Thread>>>(dev_b);
+  //transpose<<<Block, Thread>>>(dev_a);
+  //transpose<<<Block, Thread>>>(dev_b);
 
   gettimeofday(&t0, NULL);
-  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, dev_a, N, dev_b, N, &beta, dev_c3, N);
+  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, dev_b, N, dev_a, N, &beta, dev_c3, N);
+  //transpose<<<Block, Thread>>>(dev_c3);
   cudaThreadSynchronize();
   gettimeofday(&t1, NULL);
   printf("Elapsed time(cublas)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
-
-  transpose<<<Block, Thread>>>(dev_c3);
 
   HANDLE_ERROR(cudaMemcpy(c3, dev_c3, N*N*sizeof(float), cudaMemcpyDeviceToHost));
   cublasDestroy(handle);
@@ -198,13 +221,13 @@ int main(void){
     for(int j = 0; j < N; j++){
       if(c1[i*N+j] != c2[i*N+j]){
         wrong1++;
-        if(wrong1 < 20) printf("c1:%f, c2:%f\n", c1[i*N+j], c2[i*N+j]);
+        if(wrong1 < 20) printf("c1:%f, c2:%f\n", c1[(i)*N+j], c2[(i)*N+j]);
       }
       if(c1[i*N+j] != c3[i*N+j]) wrong2++;
       if(c1[i*N+j] != c4[i*N+j]) wrong4++;
-      if(c1[i*N+j] != c3[i*N+j]){
+      if(c2[i*N+j] != c3[i*N+j]){
         wrong3++;
-        if(wrong3 < 20) printf("c1:%f, c3:%f\n", c1[i*N+j], c3[i*N+j]);
+        if(wrong3 < 20) printf("c2:%f, c3:%f\n", c1[i*N+j], c3[i*N+j]);
       }
     }
   }

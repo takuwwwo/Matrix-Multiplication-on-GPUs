@@ -10,9 +10,10 @@ N*N行列の行列積。共有メモリを用いる一般的な方法。
 #include <curand.h>
 #include <sys/time.h>
 
-#define N 8192
+#define N 16384
 #define Block 8192
 #define Thread 1024
+#define BLOCK_SIZE 32
 
 void GPU_fill_rand(float *a, int row, int col){
   curandGenerator_t prng;
@@ -60,40 +61,30 @@ __global__ void mmul(float *a, float *b, float *c){
   }
 }
 
-__global__ void mmul2(float *a, float *b, float *c){
-  int acol = 0;
-  int arow = threadIdx.x;
-  int bcol = blockIdx.x;
-  int brow = arow;
-  __shared__ float cache[Thread];
-  for(int i = 0; i <= N/Block; i++){
-    for(int j = 0; j <= N/Thread; j++){        //各列の演算でのループ
-      int bcolN = (bcol < N);
-      if(brow < N && bcolN){
-        cache[brow - Thread*j] = b[brow*N + bcol];  //共有メモリに行列Bの(row, col)をコピー
-      }
-      __syncthreads();  //同期
-      if(bcolN){
-        for(int k = 0; k <= N/Thread; k++){
-          int arow2N = (arow + k*Thread)*N;
-          if(arow2N < N*N){
-            float sum = (j == 0) ? 0.0 : c[arow2N+bcol];
-            int fl = (acol+Thread < N) ? acol+Thread : N;
-            for(int l = acol; l < fl; l++){
-              sum += a[arow2N+l]*cache[l-acol];
-            }
-            c[arow2N+bcol] = sum;
-          }
-        }
-      }
-      acol += Thread;
-      brow += Thread;
-      __syncthreads();
+__global__ void mmul3(float *a, float *b, float *c, int n){
+  int row = threadIdx.y, col = threadIdx.x;
+  int arow = blockIdx.y*BLOCK_SIZE + row;
+  int bcol = blockIdx.x*BLOCK_SIZE + col;
+
+  __shared__ float cachea[BLOCK_SIZE][BLOCK_SIZE];
+  __shared__ float cacheb[BLOCK_SIZE][BLOCK_SIZE];
+  float sum = 0.0;
+
+  int ax = arow*n+col;
+  int bx = row*n+bcol;
+  for(int i = 0; i < n; ){
+    cachea[row][col] = a[ax+i];
+    cacheb[row][col] = b[bx+i*n];
+    i += BLOCK_SIZE;
+    __syncthreads();
+
+    #pragma unroll
+    for(int j = 0; j < BLOCK_SIZE; j++){
+      sum += cachea[row][j]*cacheb[j][col];
     }
-    brow = threadIdx.x;
-    bcol += Block;
-    acol = 0;
+    __syncthreads();
   }
+  c[arow*N+bcol] = sum;
 }
 
 __global__ void transpose(float *a){                            //OK
@@ -160,14 +151,25 @@ int main(void){
   //mmulcpu(a, b, c4);
 
   gettimeofday(&t0, NULL);
-  mmul<<<Block, Thread>>>(dev_a, dev_b, dev_c);
+  //mmul<<<Block, Thread>>>(dev_a, dev_b, dev_c);
   cudaThreadSynchronize();
   gettimeofday(&t1, NULL);
   printf("Elapsed time(mmul)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
   HANDLE_ERROR(cudaMemcpy(c1, dev_c, N*N*sizeof(float), cudaMemcpyDeviceToHost));
 
+  /*
   gettimeofday(&t0, NULL);
   mmul2<<<Block, Thread>>>(dev_a, dev_b, dev_c2);
+  cudaThreadSynchronize();
+  gettimeofday(&t1, NULL);
+  printf("Elapsed time(mmul2)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
+  HANDLE_ERROR(cudaMemcpy(c2, dev_c2, N*N*sizeof(float), cudaMemcpyDeviceToHost));
+*/
+
+  gettimeofday(&t0, NULL);
+  dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 grid(N/BLOCK_SIZE, N/BLOCK_SIZE);
+  mmul3<<<grid, block>>>(dev_a, dev_b, dev_c2, N);
   cudaThreadSynchronize();
   gettimeofday(&t1, NULL);
   printf("Elapsed time(mmul2)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
@@ -176,35 +178,32 @@ int main(void){
   cublasHandle_t handle;
   cublasCreate(&handle);
   float alpha = 1.0, beta = 0.0;
-  transpose<<<Block, Thread>>>(dev_a);
-  transpose<<<Block, Thread>>>(dev_b);
 
   gettimeofday(&t0, NULL);
-  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, dev_a, N, dev_b, N, &beta, dev_c3, N);
+  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, dev_b, N, dev_a, N, &beta, dev_c3, N);
   cudaThreadSynchronize();
   gettimeofday(&t1, NULL);
   printf("Elapsed time(cublas)= %.10lf\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec)/(1000.0*1000.0));
 
-  transpose<<<Block, Thread>>>(dev_c3);
+  //transpose<<<Block, Thread>>>(dev_c3);
 
   HANDLE_ERROR(cudaMemcpy(c3, dev_c3, N*N*sizeof(float), cudaMemcpyDeviceToHost));
   cublasDestroy(handle);
 
-  transpose<<<Block, Thread>>>(dev_a);
-  transpose<<<Block, Thread>>>(dev_b);
+  //transpose<<<Block, Thread>>>(dev_a);
+  //transpose<<<Block, Thread>>>(dev_b);
 
   int wrong1 = 0, wrong2 = 0, wrong3 = 0, wrong4 = 0;
   for(int i = 0; i < N; i++){
     for(int j = 0; j < N; j++){
       if(c1[i*N+j] != c2[i*N+j]){
         wrong1++;
-        if(wrong1 < 20) printf("c1:%f, c2:%f\n", c1[i*N+j], c2[i*N+j]);
       }
       if(c1[i*N+j] != c3[i*N+j]) wrong2++;
       if(c1[i*N+j] != c4[i*N+j]) wrong4++;
-      if(c1[i*N+j] != c3[i*N+j]){
+      if(c2[i*N+j] != c3[i*N+j]){
         wrong3++;
-        if(wrong3 < 20) printf("c1:%f, c3:%f\n", c1[i*N+j], c3[i*N+j]);
+        if(wrong3 < 20) printf("c2:%f, c3:%f\n", c1[i*N+j], c3[i*N+j]);
       }
     }
   }
